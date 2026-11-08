@@ -58,7 +58,7 @@ Data generation details:
 - For covariance group $g$, draw the free entries of a lower-triangular,
   five-factor loading matrix from a normal distribution with standard
   deviation $0.5\sqrt{g}$ and mean zero. Form
-  $\Sigma_g = L_g L_g^{\mathsf T} + \operatorname{diag}(v_g)$, with
+  $\Sigma_g = L_g L_g^{\mathsf T} + \mathrm{diag}(v_g)$, with
   independent node variances drawn uniformly from $0.7g$ to $1.3g$.
 
 For subject $i$,
