@@ -1,0 +1,821 @@
+---
+output: github_document
+---
+
+<!-- README.md is generated from README.Rmd. Please edit that file. -->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.path = "man/figures/README-",
+  fig.retina = 2,
+  out.width = "100%"
+)
+```
+
+# PDPMVAR Library
+
+This package is a implementation of the PDPM-VAR, lgPDPM-VAR, and rgPDPM-VAR methods developed in Kundu and Lukemire (2024):
+
+Kundu, S., and Lukemire, J. (2024). Flexible Bayesian Product Mixture Models for Vector Autoregressions. Journal of Machine Learning Research, 25(146), 1–52. Journal article
+
+## Table of contents
+
+- [Installation](#installation)
+- [PDPMVAR](#pdpmvar)
+- [lgPDPM-VAR](#lgpdpm-var)
+- [rgPDPM-VAR](#rgpdpm-var)
+
+## Installation
+
+To install this package, use ```install_github``` from the devtools library:
+
+```{r installation, eval=FALSE}
+devtools::install_github("https://github.com/JoshuaLukemire/PDPMVAR.git")
+library(PDPMVAR)
+```
+
+To rebuild this document and its figures, install ggplot2 and patchwork in
+your R library, then run:
+
+```{r rebuild, eval=FALSE}
+devtools::build_readme()
+```
+
+## PDPMVAR
+
+PDPMVAR fits a Bayesian vector autoregressive model with separate subject
+clusters for the full coefficient matrix and the residual covariance matrix.
+The lag-specific extension, lgPDPMVAR, lets coefficient groups differ by lag.
+The row-specific extension, rgPDPMVAR, lets them differ by response node.
+
+### Generate toy data
+
+We simulate 25 subjects, each with 25 nodes and 100 time points, using a VAR model with two lags.
+We assign subjects to three nearly equal groups for the coefficients and
+independently shuffle a second set of group labels for the residual covariances.
+
+Data generation details:
+
+- For each coefficient matrix, choose half the entries uniformly to be nonzero.
+  Draw their magnitudes uniformly from 0.1 to 0.5 and give each an independent
+  random sign. Rescale both lag blocks together so the largest absolute
+  eigenvalue of the companion matrix is 0.75, making the VAR stable.
+- For covariance group $g$, draw the free entries of a lower-triangular,
+  five-factor loading matrix from a normal distribution with standard deviation $0.5\sqrt{g}$ and mean
+  zero. Form $\Sigma_g = L_g L_g^{\mathsf T} + \operatorname{diag}(v_g)$, with
+  independent node variances drawn uniformly from $0.7g$ to $1.3g$.
+  
+For subject $i$,
+$y_{it} = A_{c_i}[y_{i,t-1}^{\mathsf T},y_{i,t-2}^{\mathsf T}]^{\mathsf T}
++ \epsilon_{it}$, where $\epsilon_{it} \sim N(0,\Sigma_{s_i})$.
+The coefficient and covariance labels, $c_i$ and $s_i$, can differ.
+
+<details>
+<summary>Show R code for the simulation</summary>
+
+```{r simulate}
+set.seed(20261106)
+D <- 25
+N <- 25
+T <- 100
+K <- 2
+B <- 5
+n_groups <- 3
+
+# Scale all lag matrices together until the companion matrix has spectral radius 0.75.
+# A has response nodes in rows and lagged predictors in columns: D x (D * K).
+scale_var <- function(A, K, radius = 0.75) {
+  D <- nrow(A)
+  lower <- 0
+  upper <- 1
+  for (step in seq_len(60)) {
+    middle <- (lower + upper) / 2
+    companion <- rbind(middle * A, cbind(diag(D * (K - 1)), matrix(0, D * (K - 1), D)))
+    value <- max(Mod(eigen(companion, only.values = TRUE)$values))
+    if (value < radius) lower <- middle else upper <- middle
+  }
+  return(A * (lower + upper) / 2)
+}
+
+A <- array(0, c(D, D * K, n_groups))
+Sigma <- array(0, c(D, D, n_groups))
+for (group in seq_len(n_groups)) {
+  coefficient <- matrix(0, D, D * K)
+  nonzero <- sample.int(length(coefficient), round(length(coefficient) / 2))
+  coefficient[nonzero] <- runif(length(nonzero), 0.1, 0.5) *
+    sample(c(-1, 1), length(nonzero), replace = TRUE)
+  A[, , group] <- scale_var(coefficient, K)
+
+  loadings <- matrix(rnorm(D * B, sd = 0.5), D, B) * sqrt(group)
+  loadings[upper.tri(loadings)] <- 0
+  variance <- runif(D, 0.7, 1.3) * group
+  Sigma[, , group] <- tcrossprod(loadings) + diag(variance)
+}
+coefficient_group <- sample(rep(seq_len(n_groups), length.out = N))
+covariance_group <- sample(rep(seq_len(n_groups), length.out = N))
+X <- vector("list", N)
+for (subject in seq_len(N)) {
+  series <- matrix(0, D, K + T)
+  noise <- t(chol(Sigma[, , covariance_group[subject]])) %*% matrix(rnorm(D * T), D)
+  for (time in seq_len(T)) {
+    lagged <- as.numeric(series[, K + time - seq_len(K), drop = FALSE])
+    series[, K + time] <- A[, , coefficient_group[subject]] %*% lagged + noise[, time]
+  }
+  X[[subject]] <- series[, K + seq_len(T), drop = FALSE]
+}
+
+```
+
+</details>
+
+The coefficient array has dimensions `D x (D * K) x 3`: response nodes,
+lagged predictors, and groups. Columns 1–25 contain lag 1 and columns 26–50
+contain lag 2. The covariance array is `D x D x 3`.
+Each element of `X` is a nodes-by-time matrix (`25 x 100`).
+
+Group memberships:
+
+```{r group-sizes}
+table(coefficient_group, covariance_group)
+```
+
+#### True coefficient and covariance matrices
+
+The heatmaps show matrix row 1 at the top. Dashed lines separate lag blocks. Colors share a
+common scale within each matrix type.
+
+```{r plotting-helpers, include=FALSE}
+library(ggplot2)
+
+# Arrange matrix entries for the heatmaps, with one row per cell in each panel.
+# x is D x P x G: D response nodes, P columns, and G panels.
+matrix_entries <- function(x, panels) {
+  entries <- expand.grid(row = seq_len(dim(x)[1]),
+                         column = seq_len(dim(x)[2]),
+                         panel = factor(panels, levels = panels))
+  entries$value <- as.numeric(x)
+  return(entries)
+}
+
+# Draw the true and estimated matrices with a shared color scale.
+plot_matrices <- function(entries,
+                          value_label,
+                          x_label,
+                          lag_size = NULL) {
+  limit <- max(abs(entries$value))
+  y_label <- if (is.null(lag_size)) "Node" else "Response node"
+  plot <- ggplot(entries, aes(column, row, fill = value)) +
+    geom_raster() +
+    scale_fill_gradient2(low = "#2166AC", mid = "white", high = "#B2182B",
+                         limits = c(-limit, limit)) +
+    scale_x_continuous(breaks = c(1, seq(5, max(entries$column), by = 5)),
+                       expand = expansion()) +
+    scale_y_reverse(breaks = c(1, seq(5, max(entries$row), by = 5)),
+                    expand = expansion()) +
+    coord_fixed() +
+    labs(x = x_label, y = y_label, fill = value_label) +
+    theme_classic() +
+    theme(strip.background = element_blank(), panel.spacing = grid::unit(0.7, "lines"))
+
+  if (!is.null(lag_size)) {
+    plot <- plot + geom_vline(xintercept = lag_size + 0.5, linetype = "dashed",
+                              linewidth = 0.35)
+  }
+  return(plot)
+}
+
+# Stack the true and estimated entries for the selected subjects into one table.
+compare_matrices <- function(truth, estimate, subjects) {
+  panels <- paste("Subject", subjects)
+  truth_entries    <- matrix_entries(truth[, , subjects, drop = FALSE], panels)
+  estimate_entries <- matrix_entries(estimate[, , subjects, drop = FALSE], panels)
+
+  truth_entries$source    <- "True"
+  estimate_entries$source <- "Estimated"
+  entries                <- rbind(truth_entries, estimate_entries)
+  entries$source         <- factor(entries$source, levels = c("True", "Estimated"))
+  return(entries)
+}
+```
+
+```{r truth, echo=FALSE, fig.width=11, fig.height=8, fig.alt="Heatmaps of the three true coefficient matrices and three true covariance matrices."}
+groups <- paste("Group", seq_len(n_groups))
+A_plot <- plot_matrices(matrix_entries(A, groups), "A", "Lagged predictor", D) +
+  facet_wrap(vars(panel), ncol = 1) +
+  labs(title = "Coefficients")
+Sigma_plot <- plot_matrices(matrix_entries(Sigma, groups), "Sigma", "Node") +
+  facet_wrap(vars(panel), ncol = 1) +
+  labs(title = "Residual covariances")
+
+patchwork::wrap_plots(A_plot, Sigma_plot, widths = c(1.35, 1))
+```
+
+### Fit the model and assess convergence
+
+Fit three chains with different seeds and data-based starts containing 4, 6,
+and 8 initial groups **in each partition**. All lags share one coefficient
+label per subject.
+
+The example uses the default priors and enables both supported split/merge
+moves every ten iterations.
+
+```{r load-package}
+library(PDPMVAR)
+```
+
+```{r fit, cache=TRUE, cache.path="README_cache/", cache.extra=list(X, K, B)}
+chains <- pdpmvar_chains(
+  X,
+  seeds = c(101, 202, 303),
+  initial_clusters = c(4, 6, 8),
+  K = K,
+  n_factors = B,
+  n_burnin = 1500,
+  n_mcmc = 1500,
+  coefficient_split_merge_every = 10, # split-merge freq for VAR coefs
+  split_merge_every = 10 # split-merge freq for covariance
+)
+```
+
+Each chain runs for 1,500 burn-in and 1,500 retained iterations. Check both continuous quantities and subject groupings.
+
+```{r convergence-tables}
+knitr::kable(chains$diagnostics$rhat, digits = 3)
+
+summary_columns <- c("chain", "mean_coefficient_clusters", "mean_covariance_clusters",
+                     "coefficient_partition_changes", "covariance_partition_changes",
+                     "accepted_coefficient_splits", "accepted_coefficient_merges",
+                     "accepted_splits", "accepted_merges")
+knitr::kable(chains$diagnostics$chains[, summary_columns], digits = 3)
+```
+
+R-hat compares variation within and between chains after splitting chains and
+transforming ranks. 
+Values above 1.01 suggest that more investigation or sampling is needed.
+Partition changes count changes in which subjects share a group, ignoring
+simple renaming of cluster labels. In the PDPMVAR table, `accepted_splits`
+and `accepted_merges` refer to covariance groups.
+
+```{r traces, echo=FALSE, fig.width=10, fig.height=8, fig.alt="Trace plots of group counts and four continuous summaries for the three chains."}
+# Convert a trace matrix (iterations x chains) to one row per draw and chain.
+plot_trace <- function(draws, title, y_label, burnin = NULL) {
+  entries <- expand.grid(iteration = seq_len(nrow(draws)),
+                         chain = factor(seq_len(ncol(draws))))
+  entries$value <- as.numeric(draws)
+
+  plot <- ggplot(entries, aes(iteration, value, color = chain)) +
+    scale_color_manual(values = c("#0072B2", "#D55E00", "#009E73"),
+                       guide = guide_legend(override.aes = list(alpha = 1, linewidth = 0.6))) +
+    labs(title = title, x = "Retained iteration", y = y_label, color = "Chain") +
+    theme_classic()
+
+  if (!is.null(burnin)) {
+    return(plot +
+      geom_step(linewidth = 0.45) +
+      geom_vline(xintercept = burnin, linetype = "dashed", color = "grey40") +
+      labs(x = "Iteration (including burn-in)"))
+  }
+  return(plot + geom_line(linewidth = 0.3, alpha = 0.7))
+}
+
+count_titles <- c("Coefficient groups", "Covariance groups")
+count_plots <- lapply(seq_along(count_titles), function(component) {
+  counts <- do.call(cbind, lapply(chains$fits, function(fit) fit$cluster_counts[, component]))
+  plot_trace(counts, count_titles[component], "Number of groups",
+    burnin = chains$fits[[1]]$settings$n_burnin)
+})
+
+# Plot the same continuous summaries for all three models. When shrinkage
+# has a separate trace for each partition, show one example.
+continuous_trace_plots <- function(fits, lambda_partition = NULL, lambda_title = "Lambda") {
+  trace_names  <- c("log_likelihood", "mean_node_variance", "coefficient_rms")
+  trace_titles <- c("Log likelihood", "Mean node variance", "Coefficient RMS")
+  plots <- lapply(seq_along(trace_names), function(index) {
+    draws <- do.call(cbind, lapply(fits, function(fit) {
+      fit$parameter_traces[, trace_names[index]]
+    }))
+    plot_trace(draws, trace_titles[index], "Value")
+  })
+  lambda_draws <- do.call(cbind, lapply(fits, function(fit) {
+    if (is.null(lambda_partition)) {return(fit$lambda)}
+    return(fit$lambda[, lambda_partition])
+  }))
+  return(c(plots, list(plot_trace(lambda_draws, lambda_title, "Value"))))
+}
+
+patchwork::wrap_plots(c(count_plots, continuous_trace_plots(chains$fits)), ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+Co-clustering probabilities are the fractions of retained iterations in which
+each subject pair belongs to the same group.
+
+```{r partition-diagnostics, results="asis"}
+knitr::kable(chains$diagnostics$coclustering_differences, digits = 3)
+```
+
+### Compare the estimated groups with the truth
+
+For each retained draw, compare the subject grouping with the true grouping
+using the adjusted Rand index (ARI). An ARI of 1 means the two partitions
+agree exactly, regardless of the numeric labels. An ARI near 0 indicates
+agreement close to what is expected by chance given the group sizes.
+The table averages the draw-by-draw ARIs within each chain, separately for
+the coefficient and covariance groups.
+
+```{r ari, echo=FALSE}
+# Compare one draw of the subject labels with the true partition.
+adjusted_rand <- function(labels, truth) {
+  counts <- table(labels, truth)
+  shared_pairs <- sum(choose(counts, 2))
+  fitted_pairs <- sum(choose(rowSums(counts), 2))
+  true_pairs   <- sum(choose(colSums(counts), 2))
+  expected     <- fitted_pairs * true_pairs / choose(length(truth), 2)
+  denominator  <- (fitted_pairs + true_pairs) / 2 - expected
+
+  if (denominator == 0) {return(1)}
+  return((shared_pairs - expected) / denominator)
+}
+
+ari <- data.frame(
+  chain = seq_along(chains$fits),
+  mean_A_ARI = vapply(chains$fits, function(fit) {
+    mean(apply(fit$coefficient_labels, 1, adjusted_rand, truth = coefficient_group))
+  }, numeric(1)),
+  mean_Sigma_ARI = vapply(chains$fits, function(fit) {
+    mean(apply(fit$covariance_labels, 1, adjusted_rand, truth = covariance_group))
+  }, numeric(1))
+)
+knitr::kable(ari, digits = 3)
+```
+
+### Compare estimates with the truth
+
+The following comparisons illustrate estimation. They use subject-specific posterior means, so cluster
+numbers need not be matched. We average the three chain means equally; all
+chains have the same number of retained draws.
+
+```{r estimates}
+A_estimate     <- Reduce(`+`, lapply(chains$fits, function(fit) fit$coefficient_mean)) / 3
+Sigma_estimate <- Reduce(`+`, lapply(chains$fits, function(fit) fit$covariance_mean)) / 3
+A_true         <- A[, , coefficient_group]
+Sigma_true     <- Sigma[, , covariance_group]
+
+# Compare subject-level posterior means for each chain and their average.
+estimate_rmse <- function(fits, A_average, Sigma_average) {
+  data.frame(
+    fit = c(paste("Chain", seq_along(fits)), "Equal-chain average"),
+    coefficient_rmse = c(vapply(fits, function(fit) {
+      sqrt(mean((fit$coefficient_mean - A_true)^2))
+    }, numeric(1)), sqrt(mean((A_average - A_true)^2))),
+    covariance_rmse = c(vapply(fits, function(fit) {
+      sqrt(mean((fit$covariance_mean - Sigma_true)^2))
+    }, numeric(1)), sqrt(mean((Sigma_average - Sigma_true)^2)))
+  )
+}
+knitr::kable(estimate_rmse(chains$fits, A_estimate, Sigma_estimate), digits = 4)
+```
+
+RMSE averages squared errors over all matrix entries and all subjects before
+taking the square root. Off-diagonal covariance entries appear twice.
+For the heatmaps, select one subject from each combination where both true
+group labels equal 1, 2, or 3. This selection is for display only.
+
+```{r select-subjects}
+subjects <- vapply(seq_len(n_groups), function(group) {
+  which(coefficient_group == group & covariance_group == group)[1]
+}, numeric(1))
+subjects
+```
+
+#### Coefficient matrices
+
+Rows are response nodes and columns are predictors ordered by lag. True and
+estimated matrices share a color scale. The dashed line separates the two lags.
+
+```{r coefficient-estimates, echo=FALSE, fig.width=11, fig.height=7, fig.alt="True and estimated coefficient matrices for three subjects."}
+entries <- compare_matrices(A_true, A_estimate, subjects)
+plot_matrices(entries, "A", "Lagged predictor", D) +
+  facet_grid(panel ~ source)
+```
+
+#### Covariance matrices
+
+Both axes index nodes. The same subjects appear in the same order.
+
+```{r covariance-estimates, echo=FALSE, fig.width=8, fig.height=9, fig.alt="True and estimated covariance matrices for the same three subjects."}
+entries <- compare_matrices(Sigma_true, Sigma_estimate, subjects)
+plot_matrices(entries, "Sigma", "Node") +
+  facet_grid(panel ~ source)
+```
+
+#### Entry-by-entry comparisons
+
+The dashed line marks exact agreement. Coefficient points include all entries
+for all subjects. Covariance points include the diagonal and upper triangle
+once per subject. Points overlap because subjects share true matrices.
+
+```{r scatterplots, echo=FALSE, fig.width=10, fig.height=5, fig.alt="True versus estimated coefficients and covariance entries with identity lines."}
+# Compare the entries on equal axes so the diagonal marks exact agreement.
+plot_agreement <- function(truth, estimate, title, color) {
+  entries <- data.frame(truth = as.numeric(truth), estimate = as.numeric(estimate))
+  limits  <- range(entries)
+  ggplot(entries, aes(truth, estimate)) +
+    geom_point(color = color, alpha = 0.18, size = 0.6) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", linewidth = 0.4) +
+    coord_fixed(xlim = limits, ylim = limits) +
+    labs(x = "True value", y = "Estimated value", title = title) +
+    theme_classic()
+}
+
+keep <- array(rep(upper.tri(Sigma[, , 1], diag = TRUE), N), c(D, D, N))
+A_plot <- plot_agreement(A_true, A_estimate, "Coefficients", "#0072B2")
+Sigma_plot <- plot_agreement(Sigma_true[keep], Sigma_estimate[keep],
+                             "Covariances", "#D55E00")
+
+patchwork::wrap_plots(A_plot, Sigma_plot)
+```
+
+## lgPDPM-VAR
+
+`lgpdpmvar()` lets the subjects form different groups at different lags.
+Each label selects a full $D \times D$ coefficient matrix for that lag.
+Residual covariance still has its own subject partition. In this simulation,
+the **true** coefficient labels happen to agree at both lags. The lag-specific
+fit can recover that shared structure while estimating each partition separately.
+
+### Fit the model and assess convergence
+
+Reuse the same `X` and fit two chains from different data-based starts,
+with 1,500 burn-in and 1,500 retained iterations per chain. The coefficient and covariance split/merge moves run every ten iterations.
+A guided single-subject move runs every twenty iterations at each lag.
+
+```{r lg-fit, cache=TRUE, cache.path="README_cache/", cache.extra=list(X, K, B)}
+lag_chains <- lgpdpmvar_chains(
+  X,
+  seeds = c(101, 202),
+  initial_clusters = c(4, 6),
+  K = K,
+  n_factors = B,
+  n_burnin = 1500,
+  n_mcmc = 1500,
+  coefficient_split_merge_every = 10,
+  split_merge_every = 10,
+  coefficient_relocation_every = 20 # unique to lgPDPM-VAR, proposes change in single subject, single lag
+)
+```
+
+`lgpdpmvar_chains()` reports diagnostics separately for each partition.
+The dashed line marks the end of burn-in. Group counts can agree even when
+the groups contain different subjects, so also check co-clustering agreement.
+
+```{r lg-traces, echo=FALSE, fig.width=10, fig.height=3.7, fig.alt="Group count traces for each coefficient lag and covariance in the two lgPDPMVAR chains."}
+partitions <- c(lag_1 = "Lag 1", lag_2 = "Lag 2", covariance = "Covariance")
+lag_count_plots <- lapply(names(partitions), function(partition) {
+  counts <- do.call(cbind, lapply(lag_chains$fits, function(fit) fit$cluster_counts[, partition]))
+  plot_trace(counts, partitions[[partition]], "Number of groups",
+    burnin = lag_chains$fits[[1]]$settings$n_burnin)
+})
+patchwork::wrap_plots(lag_count_plots, ncol = 3, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r lg-continuous-traces, echo=FALSE, fig.width=10, fig.height=6, fig.alt="Trace plots of log likelihood, mean node variance, coefficient RMS, and lag 1 shrinkage for both lgPDPMVAR chains."}
+patchwork::wrap_plots(continuous_trace_plots(lag_chains$fits, "lag_1", "Lambda, lag 1"),
+                      ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r lg-diagnostics}
+knitr::kable(lag_chains$diagnostics$rhat, digits = 3)
+partition_columns <- c("chain", "partition", "mean_clusters", "partition_changes",
+                       "accepted_splits", "accepted_merges")
+knitr::kable(lag_chains$diagnostics$chains[, partition_columns], digits = 3)
+knitr::kable(lag_chains$diagnostics$coclustering_differences, digits = 3)
+```
+
+Both chains recover the three true groups in every retained draw at
+each lag and for covariance. The continuous R-hat values are close to 1.
+Group-count R-hat is undefined because each count stays at three. The
+subject groupings also stay fixed, so these runs show agreement and
+recovery on this simulation, with no evidence of movement between
+partitions after burn-in.
+
+When true labels are unknown, compare the chains' co-clustering
+probabilities and check how often subjects change groups.
+
+### Compare the estimated groups with the truth
+
+Each fitted chain stores one coefficient label matrix per lag in
+`coefficient_labels`, with retained iterations in rows and subjects in columns.
+Compare each of these matrices with the same true coefficient labels. The
+table gives the mean ARI over retained draws for each partition.
+
+```{r lg-ari, echo=FALSE}
+lag_accuracy <- lapply(seq_along(lag_chains$fits), function(chain) {
+  fit <- lag_chains$fits[[chain]]
+  lag_ari <- vapply(fit$coefficient_labels, function(draws) {
+    mean(apply(draws, 1, adjusted_rand, truth = coefficient_group))
+  }, numeric(1))
+  covariance_ari <- mean(apply(fit$covariance_labels, 1, adjusted_rand, truth = covariance_group))
+  return(data.frame(chain = chain, lag_1_ARI = lag_ari[1], lag_2_ARI = lag_ari[2],
+    covariance_ARI = covariance_ari, row.names = NULL))
+})
+knitr::kable(do.call(rbind, lag_accuracy), digits = 3)
+```
+
+### Compare lgPDPMVAR estimates with the truth
+
+Average the subject-specific posterior means from the two chains, which have
+the same number of retained draws. The heatmaps use the same three subjects
+as the PDPMVAR example above. The coefficient columns show lag 1 and lag 2
+side by side, with a dashed line between them.
+
+```{r lg-estimates}
+lag_A_estimate <- Reduce(`+`, lapply(lag_chains$fits, function(fit) {
+  fit$coefficient_mean
+})) / length(lag_chains$fits)
+
+lag_Sigma_estimate <- Reduce(`+`, lapply(lag_chains$fits, function(fit) {
+  fit$covariance_mean
+})) / length(lag_chains$fits)
+
+knitr::kable(estimate_rmse(lag_chains$fits, lag_A_estimate, lag_Sigma_estimate), digits = 4)
+```
+
+```{r lg-coefficient-estimates, echo=FALSE, fig.width=11, fig.height=7, fig.alt="True and lgPDPMVAR estimated coefficient matrices for three subjects, with the two lags separated by a dashed line."}
+entries <- compare_matrices(A_true, lag_A_estimate, subjects)
+plot_matrices(entries, "A", "Lagged predictor", D) +
+  facet_grid(panel ~ source)
+```
+
+```{r lg-covariance-estimates, echo=FALSE, fig.width=8, fig.height=9, fig.alt="True and lgPDPMVAR estimated covariance matrices for the same three subjects."}
+entries <- compare_matrices(Sigma_true, lag_Sigma_estimate, subjects)
+plot_matrices(entries, "Sigma", "Node") +
+  facet_grid(panel ~ source)
+```
+
+The scatterplots compare entries across all subjects. The covariance panel
+uses the diagonal and upper triangle once per subject. The dashed line marks
+exact agreement.
+
+```{r lg-scatterplots, echo=FALSE, fig.width=10, fig.height=5, fig.alt="True versus lgPDPMVAR estimated coefficient and covariance entries with identity lines."}
+lag_A_plot <- plot_agreement(A_true, lag_A_estimate, "Coefficients", "#0072B2")
+lag_Sigma_plot <- plot_agreement(Sigma_true[keep], lag_Sigma_estimate[keep],
+                                 "Covariances", "#D55E00")
+patchwork::wrap_plots(lag_A_plot, lag_Sigma_plot)
+```
+
+## rgPDPM-VAR
+
+`rgpdpmvar()` gives each response node its own subject partition. Subjects in
+the same group for a response share its entire coefficient row across both
+lags, a row of length `D * K`. Residual covariance has a separate partition.
+We reuse the same toy data, where the true coefficient groups happen to
+agree across all response nodes.
+
+### Fit the model and assess convergence
+
+Fit two chains with four and six starting groups, respectively, using
+1,500 burn-in and 1,500 retained iterations per chain. Both split/merge moves
+are attempted every ten iterations. A guided single-subject move also runs
+every ten iterations at each response node.
+
+```{r rg-fit, cache=TRUE, cache.path="README_cache/", cache.extra=list(X, K, B)}
+row_chains <- rgpdpmvar_chains(
+  X,
+  seeds = c(101, 202),
+  initial_clusters = c(4, 6),
+  K = K,
+  n_factors = B,
+  n_burnin = 1500,
+  n_mcmc = 1500,
+  coefficient_split_merge_every = 10,
+  split_merge_every = 10,
+  coefficient_relocation_every = 10
+)
+row_fits <- row_chains$fits
+```
+
+The traces show group counts for two example response nodes and covariance.
+The dashed line marks the end of burn-in. `rgpdpmvar_chains()` calls
+`rgpdpmvar_diagnostics()` to compare the fitted chains. You can also call
+`rgpdpmvar_diagnostics(row_fits)` if you already have the fits.
+
+```{r rg-traces, echo=FALSE, fig.width=10, fig.height=3.7, fig.alt="Group count traces for two response nodes and covariance in both rgPDPMVAR chains."}
+row_partitions <- c(node_1 = "Response node 1", node_13 = "Response node 13", covariance = "Covariance")
+row_count_plots <- lapply(names(row_partitions), function(partition) {
+  counts <- do.call(cbind, lapply(row_fits, function(fit) fit$cluster_counts[, partition]))
+  plot_trace(counts, row_partitions[[partition]], "Number of groups",
+    burnin = row_fits[[1]]$settings$n_burnin)
+})
+patchwork::wrap_plots(row_count_plots, ncol = 3, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r rg-continuous-traces, echo=FALSE, fig.width=10, fig.height=6, fig.alt="Trace plots of log likelihood, mean node variance, coefficient RMS, and response node 1 shrinkage for both rgPDPMVAR chains."}
+patchwork::wrap_plots(continuous_trace_plots(row_fits, "node_1", "Lambda, response node 1"),
+                      ncol = 2, guides = "collect") &
+  theme(legend.position = "bottom")
+```
+
+```{r rg-diagnostics}
+row_diagnostics <- row_chains$diagnostics
+continuous <- colnames(row_fits[[1]]$parameter_traces)
+knitr::kable(subset(row_diagnostics$rhat, quantity %in% continuous), digits = 3, row.names = FALSE)
+```
+
+For each response node and for covariance, the co-clustering table compares
+how often subject pairs share a group. The chain table also reports how
+often each partition changes and how many splits and merges were accepted.
+
+<details>
+<summary>Show agreement for all response nodes and covariance</summary>
+
+```{r rg-partition-agreement}
+knitr::kable(subset(row_diagnostics$rhat, !quantity %in% continuous), digits = 3, row.names = FALSE)
+knitr::kable(row_diagnostics$chains[, partition_columns], digits = 3)
+knitr::kable(row_diagnostics$coclustering_differences, digits = 3)
+```
+
+</details>
+
+Both chains recover the covariance grouping and the true partitions at
+24 of the 25 response nodes in every retained draw. One chain has some
+different assignments at node 7. Compared with the same example with
+relocation disabled, the largest co-clustering difference falls from
+1.000 to 0.047, and the log-likelihood R-hat falls from 1.032 to 1.001.
+
+### Compare the estimated groups with the truth
+
+Each fit stores one matrix of subject labels per response node in
+`coefficient_labels`, with retained iterations in rows and subjects in
+columns. For each node, we average ARI across retained draws, then summarize
+those values across the 25 nodes. Covariance has one ARI per chain.
+
+```{r rg-ari, echo=FALSE}
+row_ari_by_node <- vapply(row_fits, function(fit) {
+  vapply(fit$coefficient_labels, function(draws) {
+    mean(apply(draws, 1, adjusted_rand, truth = coefficient_group))
+  }, numeric(1))
+}, numeric(D))
+covariance_ari <- vapply(row_fits, function(fit) {
+  mean(apply(fit$covariance_labels, 1, adjusted_rand, truth = covariance_group))
+}, numeric(1))
+row_accuracy <- data.frame(
+  chain = seq_along(row_fits),
+  mean_row_ARI = colMeans(row_ari_by_node),
+  median_row_ARI = apply(row_ari_by_node, 2, median),
+  min_row_ARI = apply(row_ari_by_node, 2, min),
+  covariance_ARI = covariance_ari
+)
+knitr::kable(row_accuracy, digits = 3)
+```
+
+<details>
+<summary>Show ARI by response node</summary>
+
+```{r rg-node-ari, echo=FALSE}
+knitr::kable(row_ari_by_node, col.names = paste("Chain", seq_along(row_fits)), digits = 3)
+```
+
+</details>
+
+### Compare rgPDPMVAR estimates with the truth
+
+The heatmaps compare the same three subjects as above. We average the two
+chains' subject-specific posterior means equally for display and report
+estimation error for each chain as well. Averaging alone does not establish
+agreement across chains.
+
+```{r rg-estimates}
+row_A_estimate <- Reduce(`+`, lapply(row_fits, function(fit) {
+  fit$coefficient_mean
+})) / length(row_fits)
+
+row_Sigma_estimate <- Reduce(`+`, lapply(row_fits, function(fit) {
+  fit$covariance_mean
+})) / length(row_fits)
+
+knitr::kable(estimate_rmse(row_fits, row_A_estimate, row_Sigma_estimate), digits = 4)
+```
+
+```{r rg-coefficient-estimates, echo=FALSE, fig.width=11, fig.height=7, fig.alt="True and rgPDPMVAR estimated coefficient matrices for three subjects, with lag blocks side by side."}
+entries <- compare_matrices(A_true, row_A_estimate, subjects)
+plot_matrices(entries, "A", "Lagged predictor", D) +
+  facet_grid(panel ~ source)
+```
+
+```{r rg-covariance-estimates, echo=FALSE, fig.width=8, fig.height=9, fig.alt="True and rgPDPMVAR estimated covariance matrices for the same three subjects."}
+entries <- compare_matrices(Sigma_true, row_Sigma_estimate, subjects)
+plot_matrices(entries, "Sigma", "Node") +
+  facet_grid(panel ~ source)
+```
+
+The scatterplots use all subjects. The covariance panel counts each
+diagonal and upper-triangular entry once per subject.
+
+```{r rg-scatterplots, echo=FALSE, fig.width=10, fig.height=5, fig.alt="True versus rgPDPMVAR estimated coefficient and covariance entries with identity lines."}
+row_A_plot <- plot_agreement(A_true, row_A_estimate, "Coefficients", "#0072B2")
+row_Sigma_plot <- plot_agreement(Sigma_true[keep], row_Sigma_estimate[keep],
+                                 "Covariances", "#D55E00")
+patchwork::wrap_plots(row_A_plot, row_Sigma_plot)
+```
+
+### Compare with separate and oracle VAR fits
+
+Fit an ordinary least-squares VAR for each subject using
+`stats::ar.ols()`. Use the same two lags, subject-specific centering and
+zero padding as in the PDPMVAR fits. Each regression has no intercept and
+estimates its coefficients and residual covariance using only that subject's
+observations. The residual covariance from `ar.ols()` divides by the number
+of time points.
+
+```{r individual-var}
+individual_series <- lapply(X, function(x) {
+  centered <- sweep(x, 1, rowMeans(x), "-")
+  rbind(matrix(0, K, D), t(centered))
+})
+individual_fits <- lapply(individual_series, function(series) {
+  stats::ar.ols(series, aic = FALSE, order.max = K, demean = FALSE, intercept = FALSE)
+})
+
+# ar.ols stores coefficients by lag, response and predictor. Rearrange
+# them as D x (D * K) x N, with lag blocks side by side for each subject.
+individual_A <- simplify2array(lapply(individual_fits, function(fit) {
+  matrix(aperm(fit$ar, c(2, 3, 1)), nrow = D)
+}))
+individual_Sigma <- simplify2array(lapply(individual_fits, function(fit) fit$var.pred))
+```
+
+The oracle VAR fits use the true subject labels from the simulation.
+Both estimate a shared coefficient matrix and residual covariance by
+ordinary least squares within each group.
+
+- **Coefficient groups.** Pool subjects with the same true VAR coefficients
+  across both lags. Subjects in a coefficient group can have different
+  true covariances.
+- **Coefficient and covariance combinations.** Pool subjects only when
+  both true labels agree. This gives a separate fit for each observed
+  combination, including combinations with just one subject.
+
+```{r oracle-var}
+# Build the regression rows within each subject before pooling. Each
+# matrix has T rows and D * (K + 1) columns, with responses first.
+subject_regressions <- lapply(individual_series, stats::embed, dimension = K + 1)
+
+# Fit one VAR per supplied group and return the estimates in subject order.
+# Coefficients are D x (D * K) x N and covariances are D x D x N.
+fit_oracle_var <- function(groups) {
+  members <- split(seq_len(N), groups, drop = TRUE)
+  pooled <- lapply(members, function(subjects) {
+    regression <- do.call(rbind, subject_regressions[subjects])
+    fit <- stats::lm.fit(regression[, -seq_len(D), drop = FALSE],
+                        regression[, seq_len(D), drop = FALSE])
+    list(A = t(fit$coefficients), Sigma = crossprod(fit$residuals) / nrow(regression))
+  })
+  by_subject <- unname(pooled[as.character(groups)])
+  list(A = simplify2array(lapply(by_subject, `[[`, "A")),
+       Sigma = simplify2array(lapply(by_subject, `[[`, "Sigma")))
+}
+
+oracle_coefficient <- fit_oracle_var(coefficient_group)
+joint_group <- interaction(coefficient_group, covariance_group, drop = TRUE)
+oracle_joint <- fit_oracle_var(joint_group)
+```
+
+Compare the least-squares fits and the three mixture models' equal-chain
+posterior means with the known simulated matrices. RMSE is calculated over
+all subjects and matrix entries.
+
+```{r individual-var-rmse}
+estimates <- list(
+  "Separate VAR"                   = list(A = individual_A, Sigma = individual_Sigma),
+  "Oracle VAR, coefficient groups" = oracle_coefficient,
+  "Oracle VAR, joint groups"        = oracle_joint,
+  "PDPMVAR"                        = list(A = A_estimate, Sigma = Sigma_estimate),
+  "lgPDPM-VAR"                     = list(A = lag_A_estimate, Sigma = lag_Sigma_estimate),
+  "rgPDPM-VAR"                     = list(A = row_A_estimate, Sigma = row_Sigma_estimate)
+)
+
+rmse <- function(estimate, truth) sqrt(mean((estimate - truth)^2))
+knitr::kable(data.frame(
+  model = names(estimates),
+  coefficient_rmse = vapply(estimates, function(fit) rmse(fit$A, A_true), numeric(1)),
+  covariance_rmse = vapply(estimates, function(fit) rmse(fit$Sigma, Sigma_true), numeric(1)),
+  row.names = NULL
+), digits = 4)
+```
+
+Pooling by coefficient group gives the more accurate oracle coefficient
+estimates. Pooling by both labels gives the more accurate oracle covariance
+estimates, but divides subjects who share the same coefficient matrix into
+smaller groups. The mixture models can share coefficients and covariances
+across different sets of subjects.
+
+## Acknowledgments
+
+We used OpenAI Codex to help translate the original Julia implementation into R
+and C++ with RcppEigen, and to develop tests and documentation for the package.

@@ -1,0 +1,9 @@
+^\.DS_Store$
+^\.Rproj\.user$
+^.*\.Rproj$
+^\.Rhistory$
+^\.RData$
+^README\.Rmd$
+^README\.html$
+^README_cache$
+^tools/build-readme\.R$

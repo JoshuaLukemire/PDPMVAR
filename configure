@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# Link Accelerate on macOS for the large collapsed-lag cross-products.
+accelerate_cppflags=
+accelerate_libs=
+case "$(uname -s)" in
+    Darwin)
+        accelerate_cppflags="-DPDPMVAR_ACCELERATE"
+        accelerate_libs="-framework Accelerate"
+        ;;
+esac
+
+sed -e "s|@ACCELERATE_CPPFLAGS@|${accelerate_cppflags}|g" \
+    -e "s|@ACCELERATE_LIBS@|${accelerate_libs}|g" \
+    src/Makevars.in > src/Makevars

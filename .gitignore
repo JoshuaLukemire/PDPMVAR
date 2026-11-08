@@ -1,0 +1,12 @@
+# Local compiled outputs; wrappers are regenerated using Rcpp attributes.
+src/*.o
+src/*.so
+src/*.dll
+src/Makevars
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/
+README_cache/
+/README.html
+README.html
