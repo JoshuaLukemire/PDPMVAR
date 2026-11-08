@@ -62,8 +62,7 @@ Data generation details:
   independent node variances drawn uniformly from $0.7g$ to $1.3g$.
 
 For subject $i$,
-$y_{it} = A_{c_i}[y_{i,t-1}^{\mathsf T},y_{i,t-2}^{\mathsf T}]^{\mathsf T}
-+ \epsilon_{it}$, where $\epsilon_{it} \sim N(0,\Sigma_{s_i})$. The
+$y_{it} = A_{c_i}[y_{i,t-1}^{\mathsf T},y_{i,t-2}^{\mathsf T}]^{\mathsf T} + \epsilon_{it}$, where $\epsilon_{it} \sim N(0,\Sigma_{s_i})$. The
 coefficient and covariance labels, $c_i$ and $s_i$, can differ.
 
 <details>
